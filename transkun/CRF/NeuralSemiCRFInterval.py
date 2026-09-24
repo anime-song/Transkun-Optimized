@@ -10,99 +10,130 @@ from typing import List,Tuple, Optional
 
      
 @torch.jit.script
-def viterbiBackward(score, noiseScore, forcedStartPos: Optional[List[int]]=None):
-    # score: [nEndPos,  nBeginPos, nBatch]
-    # noiseScore: [nEndPos-1, nBatch]
+def _viterbi_backward_tensors(
+    score: torch.Tensor,
+    noise_score: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Viterbi DPをデバイス上で実行し、tracebackに必要な状態を返す。"""
+    assert score.dim() == 3 and score.shape[0] == score.shape[1]
+    time_steps = int(score.shape[0])
+    track_count = int(score.shape[2])
 
-    assert(len(score.shape) == 3)
-    assert(score.shape[0] == score.shape[1])
-    T = score.shape[0]
-    nBatch = score.shape[2]
-    
-    q = torch.zeros(T, nBatch, device = score.device)
+    # The original decoder accumulated in the default torch float dtype.
+    q = torch.zeros(time_steps, track_count, device=score.device)
+    pointers = torch.jit.annotate(List[torch.Tensor], [])
+    q[time_steps - 1] = score[time_steps - 1, time_steps - 1, :] * (
+        score[time_steps - 1, time_steps - 1, :] > 0
+    )
 
-    # for back tracking
-    ptr = []
+    for offset in range(1, time_steps):
+        begin = time_steps - offset - 1
 
-    scoreT = score.transpose(0,1).contiguous()
+        # 区間候補とskip候補を別々に評価し、時刻ごとの一時的なcatを作らない。
+        interval_values = q[begin + 1 :, :] + score[begin + 1 :, begin, :]
+        best_interval_value, interval_selection = interval_values.max(dim=0)
+        skip_value = q[begin + 1, :] + noise_score[begin, :]
 
-    q[T-1] = score[T-1, T-1, :]* (score[T-1,T-1,:]>0)
+        # 旧実装ではskipが候補の先頭にあり、同点時はskipが選ばれていた。
+        use_interval = best_interval_value > skip_value
+        pointers.append(torch.where(use_interval, interval_selection, -1))
+        best_value = torch.where(use_interval, best_interval_value, skip_value)
 
-    for i in range(1,T):
+        singleton_mask = score[begin, begin, :] > 0
+        q[begin] = best_value + score[begin, begin, :] * singleton_mask
 
-        # update v_on
-        subScore  = scoreT[T-i-1, T-i:,:]
-
-        tmp = torch.cat(
-            [
-            q[T-i:T-i+1, :] + noiseScore[T-i-1, :],              # skip
-            q[T-i:, :]+ subScore       # an interval 
-            ],
-            dim = 0
-        )
-        
-        curV, selection = tmp.max(dim = 0)
-
-        ptr.append(selection-1)
-
-
-        singletonMask = score[T-i-1, T-i-1,:]>0
-
-        q[T-i-1] = curV+ score[T-i-1,T-i-1,:]*singletonMask
+    # traceback順のpointerをtrack-majorで直接積み、転置コピーを発生させない。
+    return (
+        torch.stack(pointers, dim=1),
+        torch.diagonal(score, dim1=0, dim2=1) > 0,
+    )
 
 
-    qFinal = q[0]
+def viterbiBackward(
+    score: torch.Tensor,
+    noiseScore: torch.Tensor,
+    forcedStartPos: Optional[List[int]] = None,
+    *,
+    backend: str = "auto",
+) -> List[List[Tuple[int, int]]]:
+    """
+    Decode the best sequence of closed intervals.
 
-    ptr= torch.stack(ptr, dim = 0).cpu()
+    Args:
+        score: [T, T, B], indexed by [end, begin, track].
+        noiseScore: [T-1, B] skip scores.
+        forcedStartPos: Optional start position for each track.
+        backend: auto selects Triton for CUDA float32 if installed.
+    """
+    if backend not in {"auto", "torch", "triton"}:
+        raise ValueError("backend must be one of {'auto', 'torch', 'triton'}")
+    use_triton = backend == "triton" or (
+        backend == "auto" and score.device.type == "cuda"
+        and score.dtype == torch.float32 and noiseScore.dtype == torch.float32
+        and score.shape[0] >= 2
+    )
+    if use_triton:
+        if score.device.type != "cuda":
+            raise ValueError("Triton Semi-CRF decoding requires a CUDA tensor")
+        try:
+            from .semi_crf_triton import viterbi_backward_triton
+        except ModuleNotFoundError as exc:
+            if exc.name is None or not exc.name.startswith("triton"):
+                raise
+            if backend == "triton":
+                raise RuntimeError(
+                    "Triton Semi-CRF decoding requires the triton package"
+                ) from exc
+            use_triton = False
+        if use_triton:
+            return viterbi_backward_triton(score, noiseScore, forcedStartPos)
 
-    scoreDiagInclusion = (torch.diagonal(score, dim1= 0, dim2=1)>0).cpu()
+    if score.shape[0] == 1:
+        diagonal = (score[0, 0] > 0).cpu().tolist()
+        return [[(0, 0)] if selected else [] for selected in diagonal]
 
+    pointers, diag_inclusion = _viterbi_backward_tensors(score, noiseScore)
+    time_steps = int(score.shape[0])
+    track_count = int(score.shape[2])
+
+    # Copy only tracks that can contain notes; traverse Python lists rather
+    # than repeatedly reading scalar values from CPU tensors.
+    active_tracks = (pointers >= 0).any(dim=1) | diag_inclusion.any(dim=1)
+    active_index = active_tracks.nonzero().flatten()
+    pointer_values = pointers.index_select(0, active_index).cpu().tolist()
+    diag_values = diag_inclusion.index_select(0, active_index).cpu().tolist()
 
     if forcedStartPos is None:
-        forcedStartPos = [0]* nBatch
+        forcedStartPos = [0] * track_count
 
+    result: List[List[Tuple[int, int]]] = [[] for _ in range(track_count)]
+    for row_index, track in enumerate(active_index.tolist()):
+        position = forcedStartPos[track]
+        track_result: List[Tuple[int, int]] = []
+        pointer_row = pointer_values[row_index]
+        current_diag = diag_values[row_index]
 
-    # perform backtracking 
-    result: List[List[Tuple[int, int]]]  =  []
-    # print(ptr)
+        while position < time_steps - 1:
+            selection = int(pointer_row[time_steps - position - 2])
 
-    
-    for idx in range(nBatch):
-        j = forcedStartPos[idx]
+            if bool(current_diag[position]):
+                track_result.append((position, position))
 
-        curResult : List[Tuple[int, int]]  = []
-
-
-        curDiag = scoreDiagInclusion[idx]
-        while j< T-1:
-            # print(j)
-            curSelecton= int(ptr[T-j-2][idx])
-
-            if bool(curDiag[j]):
-                curResult.append((j,j))
-
-
-            if curSelecton<0:
-                j += 1
+            if selection < 0:
+                position += 1
             else:
-                # print("curSelect:", curSelecton)
-                i = curSelecton+j+1
+                end = selection + position + 1
+                track_result.append((position, end))
+                position = end
 
-                # print((i,j))
-                curResult.append((j,i))
+        if bool(current_diag[time_steps - 1]):
+            track_result.append((time_steps - 1, time_steps - 1))
 
-                j = i
-        
-
-        if score[T-1,T-1, idx]>0:
-            curResult.append((T-1,T-1))
-        
-        
-
-        result.append(curResult)
+        result[track] = track_result
 
     return result
-     
+
+
 @torch.jit.script
 def viterbi(score, noiseScore, forcedStartPos: Optional[List[int]]=None):
     # score: [nEndPos,  nBeginPos, nBatch]
@@ -564,11 +595,13 @@ class NeuralSemiCRFInterval:
         self.noiseScore = noiseScore
     
 
-    def decode(self, forcedStartPos=None, forward=False):
+    def decode(self, forcedStartPos=None, forward=False, *, backend="auto"):
         if forward:
+            if backend not in ("auto", "torch"):
+                raise ValueError("forward decoding only supports the torch backend")
             return viterbi(self.score, self.noiseScore, forcedStartPos)
         else:
-            return viterbiBackward(self.score, self.noiseScore, forcedStartPos)
+            return viterbiBackward(self.score, self.noiseScore, forcedStartPos, backend=backend)
 
 
     def evalPath(self, intervals):
@@ -577,15 +610,35 @@ class NeuralSemiCRFInterval:
         return pathScore
             
 
-    def computeLogZ(self, noBackward =False):
+    def computeLogZ(self, noBackward=False, *, backend="auto"):
         """ compute the log normalization factor """
+        if backend not in ("auto", "torch", "triton"):
+            raise ValueError("backend must be 'auto', 'torch', or 'triton'")
         if noBackward:
+            if backend == "triton":
+                raise ValueError("noBackward log-partition only supports torch")
             return computeLogZ(self.score, self.noiseScore)
-        else:
-            return computeLogZFasterGrad(self.score, self.noiseScore)
+        use_triton = backend == "triton" or (
+            backend == "auto" and self.score.device.type == "cuda"
+            and self.score.dtype == torch.float32
+            and self.noiseScore.dtype == torch.float32
+        )
+        if use_triton:
+            if self.score.device.type != "cuda":
+                raise ValueError("Triton Semi-CRF loss requires a CUDA tensor")
+            try:
+                from .semi_crf_loss_triton import compute_log_z_triton
+            except ModuleNotFoundError as exc:
+                if exc.name is None or not exc.name.startswith("triton"):
+                    raise
+                if backend == "triton":
+                    raise RuntimeError("Triton Semi-CRF loss requires the triton package") from exc
+            else:
+                return compute_log_z_triton(self.score, self.noiseScore)
+        return computeLogZFasterGrad(self.score, self.noiseScore)
 
-    def logProb(self, intervals, noBackward=False):
-        return self.evalPath(intervals) - self.computeLogZ(noBackward=noBackward)
+    def logProb(self, intervals, noBackward=False, *, backend="auto"):
+        return self.evalPath(intervals) - self.computeLogZ(noBackward=noBackward, backend=backend)
 
 
 if __name__ == "__main__":
@@ -619,4 +672,3 @@ if __name__ == "__main__":
             with torch.no_grad():
                 recons = crf.decode()
                 print(recons)
-

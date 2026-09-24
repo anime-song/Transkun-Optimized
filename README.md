@@ -94,6 +94,22 @@ decoded = crf.decode()
 decoded = crf.decode(forcedStartPos = [4]*NBatch)
 ```
 
+On CUDA with float32 scores, `decode()` and the training-time `computeLogZ()`
+automatically use the Triton Semi-CRF kernels when Triton is installed. The
+original PyTorch implementation remains available with `backend="torch"`:
+
+```python
+decoded = crf.decode(backend="torch")
+log_z = crf.computeLogZ(backend="torch")
+```
+
+Pass `backend="triton"` to require Triton explicitly. CPU and unsupported
+dtypes use PyTorch in the default `auto` mode. Triton is supplied with many
+Linux PyTorch installations; on Windows, install a compatible `triton-windows`
+package separately. The forward decoder (`decode(forward=True)`) and
+`computeLogZ(noBackward=True)` remain PyTorch-only. Run the equivalence tests
+with `python -m unittest discover -s tests`.
+
 ### Transcribing piano performance into a MIDI file
 
 ```bash
