@@ -139,6 +139,30 @@ This script can also be used directly as the command line command 'transkun' if 
 $ transkun input.mp3 output.mid
 ```
 
+### Optional Transformer compilation
+
+On PyTorch versions with `nn.Module.compile`, add `--compileTransformer` to
+transcription or training to compile only the Transformer blocks in
+`backbone.encoderLayers`:
+
+```bash
+transkun input.mp3 output.mid --device cuda --compileTransformer
+python3 -m transkun.train ... --compileTransformer
+```
+
+The option is off by default. `--compileMode` passes a mode such as `default`
+or `reduce-overhead` to `torch.compile` (default: `default`). In Python, call
+`transkun.runtime.maybe_compile_transformer(model, enabled=True)` after loading
+weights and moving the model to its device. The model and its checkpoint keys
+are unchanged; feature extraction, scoring, and Semi-CRF stay eager.
+
+The blocks use `dynamic=True` and receive contiguous tensors. A last batch of
+size 1 is duplicated only through the Transformer and sliced back afterward,
+avoiding PyTorch's size-1 specialization. Compilation happens on the first
+call; other shape specializations or a separate training/evaluation graph can
+still cause recompilation. Measure speed after warm-up on the intended device
+and workload.
+
 ## Model Cards
 
 |                  |Dataset                   |Activation|      |      |Note Onset|      |      |Note Onset+Offset|      |      |Note Onset+Offset+ vel.|      |      |pedal activation|      |      |pedal onset|      |      |pedal onset+offset|      |      |

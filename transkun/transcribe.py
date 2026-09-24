@@ -1,4 +1,5 @@
 import argparse
+from .runtime import maybe_compile_transformer
 
 from .Data import writeMidi
 import torch
@@ -32,6 +33,8 @@ def main():
     argumentParser.add_argument("--device", default = "cpu", nargs= "?", help = " The device used to perform the most computations (optional), DEFAULT: cpu")
     argumentParser.add_argument("--segmentHopSize", type=float, required=False, help = " The segment hopsize for processing the entire audio file (s), DEFAULT: the value defined in model conf")
     argumentParser.add_argument("--segmentSize", type=float, required=False, help = " The segment size for processing the entire audio file (s), DEFAULT: the value defined in model conf")
+    argumentParser.add_argument("--compileTransformer", action="store_true", help="Compile Transformer blocks with torch.compile (PyTorch 2.x)")
+    argumentParser.add_argument("--compileMode", default="default", help="torch.compile mode for Transformer blocks, DEFAULT: default")
 
     args = argumentParser.parse_args()
 
@@ -62,6 +65,7 @@ def main():
         model.load_state_dict(checkpoint["best_state_dict"], strict=False)
 
     model.eval()
+    maybe_compile_transformer(model, enabled=args.compileTransformer, mode=args.compileMode)
 
 
     audioPath = args.audioPath

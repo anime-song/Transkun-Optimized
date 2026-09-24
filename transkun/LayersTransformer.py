@@ -558,6 +558,7 @@ class Backbone(nn.Module):
             ) for i in range(nLayers)]
 
         self.encoderLayers = nn.ModuleList(encoderLayers)
+        self.compileTransformer = False
 
         self.normEncoder = nn.Identity()
 
@@ -623,9 +624,24 @@ class Backbone(nn.Module):
 
         hAll = torch.cat( [h, hTarget], dim = -2)
 
+        # A compiled BasicBlock sees batch as its first dimension. Dynamo
+        # specializes size 1 even with dynamic=True; duplicate that lone
+        # sample to keep the compiled region's batch dimension >= 2. Attention
+        # never crosses batches, and the duplicate is removed immediately.
+        singleCompiledBatch = self.compileTransformer and hAll.shape[0] == 1
+        if singleCompiledBatch:
+            hAll = torch.cat([hAll, hAll], dim=0)
 
         for l in self.encoderLayers:
+            # BasicBlock returns a transposed view. Normalize the layout at
+            # each compiled region's boundary so variable batch sizes do not
+            # also present different strides to torch.compile.
+            if self.compileTransformer:
+                hAll = hAll.contiguous()
             hAll = checkpoint(l, hAll)
+
+        if singleCompiledBatch:
+            hAll = hAll[:1]
 
 
         h, hTarget = hAll.split([h.shape[-2], hTarget.shape[-2]], dim = -2)
@@ -891,4 +907,3 @@ if __name__ == "__main__":
 
         t2 = time.time()
         print(t2-t1)
-

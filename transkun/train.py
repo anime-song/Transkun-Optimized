@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from .TrainUtil import *
+from .runtime import maybe_compile_transformer
 import argparse
 
 import moduleconf
@@ -71,6 +72,7 @@ def train(workerId, nWorker, filename, runSeed, args):
         
 
     startEpoch, startIter, model,  lossTracker, best_state_dict, optimizer, lrScheduler= load_checkpoint(TransKun, conf, filename,device)
+    maybe_compile_transformer(model, enabled=args.compileTransformer, mode=args.compileMode)
     print("#{} loaded".format(workerId))
 
 
@@ -365,6 +367,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--master_port', help='master port number for distributed training', default = "29500")
     parser.add_argument('--allow_tf32', action = "store_true")
+    parser.add_argument('--compileTransformer', action='store_true', help='Compile Transformer blocks with torch.compile (PyTorch 2.x)')
+    parser.add_argument('--compileMode', default='default', help='torch.compile mode for Transformer blocks, DEFAULT: default')
     parser.add_argument('--datasetPath', required = True)
     parser.add_argument('--datasetMetaFile_train', required = True)
     parser.add_argument('--datasetMetaFile_val', required = True)
@@ -401,4 +405,3 @@ if __name__ == '__main__':
         train(0, 1, saved_filename, runSeed, args)
     else:
         mp.spawn(fn=train, args=(num_processes, saved_filename, runSeed, args),  nprocs = num_processes, join=True, daemon=False)
-
