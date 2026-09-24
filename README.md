@@ -156,10 +156,12 @@ or `reduce-overhead` to `torch.compile` (default: `default`). In Python, call
 weights and moving the model to its device. The model and its checkpoint keys
 are unchanged; feature extraction, scoring, and Semi-CRF stay eager.
 
-The blocks use `dynamic=True` to accommodate changing batch or frame counts.
-Compilation happens on the first call and can still recur for specialized
-shapes (notably a final batch of size 1) or a separate training/evaluation
-graph. Measure speed after warm-up on the intended device and workload.
+The blocks use `dynamic=True` and receive contiguous tensors. A last batch of
+size 1 is duplicated only through the Transformer and sliced back afterward,
+avoiding PyTorch's size-1 specialization. Compilation happens on the first
+call; other shape specializations or a separate training/evaluation graph can
+still cause recompilation. Measure speed after warm-up on the intended device
+and workload.
 
 ## Model Cards
 

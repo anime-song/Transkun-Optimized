@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from transkun.LayersTransformer import BasicBlock
+from transkun.LayersTransformer import Backbone, BasicBlock
 from transkun.runtime import maybe_compile_transformer
 
 
@@ -108,6 +108,61 @@ class CompileTransformerTests(unittest.TestCase):
             torch.testing.assert_close(y.grad, x.grad)
             for left, right in zip(eager.parameters(), compiled.parameters()):
                 torch.testing.assert_close(right.grad, left.grad)
+
+    @unittest.skipUnless(hasattr(nn.Module, "compile"), "nn.Module.compile is unavailable")
+    def test_real_backbone_reuses_graph_for_partial_batch(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = Backbone(
+                    inputSize=2, baseSize=4, posEmbedInitGamma=1, nHead=2,
+                    fourierSize=8, hiddenFactor=2, hiddenFactorAttn=1,
+                    expansionFactor=1, dropoutProb=0, nLayers=1,
+                    enabledAttn=["F", "T"], useGradientCheckpoint=False,
+                )
+
+            def forward(self, x):
+                return self.backbone(x, outputIndices=torch.tensor([21, 22]))
+
+        eager = Model().eval()
+        compiled = copy.deepcopy(eager)
+        graphs = []
+
+        def counting_backend(graph_module, _example_inputs):
+            graphs.append(graph_module)
+            return graph_module.forward
+
+        def compile_with_counting_backend(module, *, backend, mode, fullgraph, dynamic):
+            self.assertEqual(backend, "inductor")
+            self.assertTrue(dynamic)
+            module.forward = torch.compile(
+                module.forward, backend=counting_backend,
+                fullgraph=fullgraph, dynamic=dynamic,
+            )
+
+        with patch.object(nn.Module, "compile", compile_with_counting_backend):
+            maybe_compile_transformer(compiled, enabled=True)
+
+        with torch.inference_mode():
+            for batch_size in (4, 1, 2, 4):
+                x = torch.randn(batch_size, 32, 8, 2)
+                torch.testing.assert_close(compiled(x), eager(x))
+                self.assertEqual(len(graphs), 1)
+
+        # The duplicated row does not contribute to the retained row's
+        # output or gradient because attention stays within each batch item.
+        eager.train()
+        compiled.train()
+        x = torch.randn(1, 32, 8, 2, requires_grad=True)
+        y = x.detach().clone().requires_grad_()
+        expected = eager(x)
+        actual = compiled(y)
+        torch.testing.assert_close(actual, expected)
+        expected.sum().backward()
+        actual.sum().backward()
+        torch.testing.assert_close(y.grad, x.grad)
+        for left, right in zip(eager.parameters(), compiled.parameters()):
+            torch.testing.assert_close(right.grad, left.grad)
 
 
 if __name__ == "__main__":

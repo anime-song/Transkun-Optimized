@@ -13,7 +13,8 @@ def maybe_compile_transformer(model, *, enabled=False, mode="default", backend="
     if not enabled:
         return model
 
-    layers = getattr(getattr(model, "backbone", None), "encoderLayers", None)
+    backbone = getattr(model, "backbone", None)
+    layers = getattr(backbone, "encoderLayers", None)
     if layers is None or len(layers) == 0:
         raise ValueError("Expected model.backbone.encoderLayers to contain Transformer blocks")
     if not hasattr(torch.nn.Module, "compile"):
@@ -21,4 +22,5 @@ def maybe_compile_transformer(model, *, enabled=False, mode="default", backend="
 
     for layer in layers:
         layer.compile(backend=backend, mode=mode, fullgraph=False, dynamic=True)
+    backbone.compileTransformer = True
     return model
